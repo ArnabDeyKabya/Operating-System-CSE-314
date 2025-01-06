@@ -1,0 +1,1402 @@
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+new file mode 100644
+index 0000000..8782f84
+--- /dev/null
++++ b/.vscode/settings.json
+@@ -0,0 +1,6 @@
++{
++    "files.associations": {
++        "proc.h": "c",
++        "procinfo.h": "c"
++    }
++}
+diff --git a/Makefile b/Makefile
+index 62fd0f8..c4dae69 100644
+--- a/Makefile
++++ b/Makefile
+@@ -139,6 +139,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_trace\
++	$U/_load\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index d1b6bb9..255afae 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -8,6 +8,9 @@ struct spinlock;
+ struct sleeplock;
+ struct stat;
+ struct superblock;
++struct procInfo;
++
++
+ 
+ // bio.c
+ void            binit(void);
+@@ -106,10 +109,12 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++void            info_helper(struct procInfo*);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+-
++void            inttostring(char *, int);
++void            hextostring(char *, uint64);
+ // spinlock.c
+ void            acquire(struct spinlock*);
+ int             holding(struct spinlock*);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 58a8a0b..82bb791 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -5,6 +5,7 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "procinfo.h"
+ 
+ struct cpu cpus[NCPU];
+ 
+@@ -54,6 +55,7 @@ procinit(void)
+   for(p = proc; p < &proc[NPROC]; p++) {
+       initlock(&p->lock, "proc");
+       p->state = UNUSED;
++      p->tracenum = -1;  // Initialize tracing to disabled (-1 means no trace)
+       p->kstack = KSTACK((int) (p - proc));
+   }
+ }
+@@ -686,3 +688,5 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..f8c892c 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -91,6 +91,7 @@ struct proc {
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
++  int tracenum;                // added: Trace system call number
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+diff --git a/kernel/procinfo.h b/kernel/procinfo.h
+new file mode 100644
+index 0000000..1ad95ff
+--- /dev/null
++++ b/kernel/procinfo.h
+@@ -0,0 +1,6 @@
++struct procInfo {
++    int activeProcess;
++    int totalProcess;
++    int memsize;
++    int totalMemSize;
++};
+\ No newline at end of file
+diff --git a/kernel/string.c b/kernel/string.c
+index 153536f..ed55e3b 100644
+--- a/kernel/string.c
++++ b/kernel/string.c
+@@ -105,3 +105,56 @@ strlen(const char *s)
+   return n;
+ }
+ 
++//my added
++void inttostring(char* str, int num)
++{
++    int i, rem, len = 0, n;
++    n = num;
++    if(n==0)
++      len=1;
++    while (n != 0)
++    {
++        len++;
++        n /= 10;
++    }
++    for (i = 0; i < len; i++)
++    {
++        rem = num % 10;
++        num = num / 10;
++        str[len - (i + 1)] = rem + '0';
++    }
++    str[len] = '\0';
++}
++
++void hextostring(char* str,uint64 num)
++{
++  int i, rem, len = 0;
++
++    uint64 n = num;
++    char let[]="abcdef";
++    if(n==0)
++      len=1;
++    while (n != 0)
++    {
++        len++;
++        n /= 16;
++    }
++    for (i = 0; i < len; i++)
++    {
++        rem = num % 16;
++        num = num / 16;
++        if(rem>9)
++          str[18 - (i + 1)] = let[rem-10];
++        else
++          str[18 - (i + 1)] = rem + '0';
++    }
++    while(i<16)
++    {
++      str[18 - (i + 1)] = 0 + '0';
++      i++;
++    }
++    str[0]='0';
++    str[1]='x';
++    str[18] = '\0';
++}
++
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..ba1aa98 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -7,25 +7,25 @@
+ #include "syscall.h"
+ #include "defs.h"
+ 
++// int flag = 0; //added: flag to check if tracing is enabled
++
+ // Fetch the uint64 at addr from the current process.
+-int
+-fetchaddr(uint64 addr, uint64 *ip)
++int fetchaddr(uint64 addr, uint64 *ip)
+ {
+   struct proc *p = myproc();
+-  if(addr >= p->sz || addr+sizeof(uint64) > p->sz) // both tests needed, in case of overflow
++  if (addr >= p->sz || addr + sizeof(uint64) > p->sz) // both tests needed, in case of overflow
+     return -1;
+-  if(copyin(p->pagetable, (char *)ip, addr, sizeof(*ip)) != 0)
++  if (copyin(p->pagetable, (char *)ip, addr, sizeof(*ip)) != 0)
+     return -1;
+   return 0;
+ }
+ 
+ // Fetch the nul-terminated string at addr from the current process.
+ // Returns length of string, not including nul, or -1 for error.
+-int
+-fetchstr(uint64 addr, char *buf, int max)
++int fetchstr(uint64 addr, char *buf, int max)
+ {
+   struct proc *p = myproc();
+-  if(copyinstr(p->pagetable, buf, addr, max) < 0)
++  if (copyinstr(p->pagetable, buf, addr, max) < 0)
+     return -1;
+   return strlen(buf);
+ }
+@@ -34,7 +34,8 @@ static uint64
+ argraw(int n)
+ {
+   struct proc *p = myproc();
+-  switch (n) {
++  switch (n)
++  {
+   case 0:
+     return p->trapframe->a0;
+   case 1:
+@@ -52,30 +53,35 @@ argraw(int n)
+   return -1;
+ }
+ 
++// char args[MAXARG][20]; //added: array to store arguments
++
+ // Fetch the nth 32-bit system call argument.
+-void
+-argint(int n, int *ip)
++void argint(int n, int *ip)
+ {
+   *ip = argraw(n);
++  // if(flag == 1) //added: if tracing is enabled, print argument
++  // inttostring(args[n],*ip); //added: store argument in args array
+ }
+ 
+ // Retrieve an argument as a pointer.
+ // Doesn't check for legality, since
+ // copyin/copyout will do that.
+-void
+-argaddr(int n, uint64 *ip)
++void argaddr(int n, uint64 *ip)
+ {
+   *ip = argraw(n);
++  // if(flag == 1) //added: if tracing is enabled, print argument
++  // hextostring(args[n],*ip); //added: store argument in args array
+ }
+ 
+ // Fetch the nth word-sized system call argument as a null-terminated string.
+ // Copies into buf, at most max.
+ // Returns string length if OK (including nul), -1 if error.
+-int
+-argstr(int n, char *buf, int max)
++int argstr(int n, char *buf, int max)
+ {
+   uint64 addr;
++  // flag = 0; //added: reset flag
+   argaddr(n, &addr);
++  // flag = 1; //added: set flag
+   return fetchstr(addr, buf, max);
+ }
+ 
+@@ -101,47 +107,178 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_trace(void); // added: trace system call
++extern uint64 sys_info(void);  // added: info system call
++extern uint64 sys_savestring(void);
++extern uint64 sys_loadstring(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+ static uint64 (*syscalls[])(void) = {
+-[SYS_fork]    sys_fork,
+-[SYS_exit]    sys_exit,
+-[SYS_wait]    sys_wait,
+-[SYS_pipe]    sys_pipe,
+-[SYS_read]    sys_read,
+-[SYS_kill]    sys_kill,
+-[SYS_exec]    sys_exec,
+-[SYS_fstat]   sys_fstat,
+-[SYS_chdir]   sys_chdir,
+-[SYS_dup]     sys_dup,
+-[SYS_getpid]  sys_getpid,
+-[SYS_sbrk]    sys_sbrk,
+-[SYS_sleep]   sys_sleep,
+-[SYS_uptime]  sys_uptime,
+-[SYS_open]    sys_open,
+-[SYS_write]   sys_write,
+-[SYS_mknod]   sys_mknod,
+-[SYS_unlink]  sys_unlink,
+-[SYS_link]    sys_link,
+-[SYS_mkdir]   sys_mkdir,
+-[SYS_close]   sys_close,
++    [SYS_fork] sys_fork,
++    [SYS_exit] sys_exit,
++    [SYS_wait] sys_wait,
++    [SYS_pipe] sys_pipe,
++    [SYS_read] sys_read,
++    [SYS_kill] sys_kill,
++    [SYS_exec] sys_exec,
++    [SYS_fstat] sys_fstat,
++    [SYS_chdir] sys_chdir,
++    [SYS_dup] sys_dup,
++    [SYS_getpid] sys_getpid,
++    [SYS_sbrk] sys_sbrk,
++    [SYS_sleep] sys_sleep,
++    [SYS_uptime] sys_uptime,
++    [SYS_open] sys_open,
++    [SYS_write] sys_write,
++    [SYS_mknod] sys_mknod,
++    [SYS_unlink] sys_unlink,
++    [SYS_link] sys_link,
++    [SYS_mkdir] sys_mkdir,
++    [SYS_close] sys_close,
++    [SYS_trace] sys_trace, // added: trace system call
++    [SYS_info] sys_info,   // added: memsize system call
++    [SYS_savestring] sys_savestring,
++    [SYS_loadstring] sys_loadstring,
+ };
+ 
+-void
+-syscall(void)
++static char *syscallnames[] = {
++    [SYS_fork] "fork",
++    [SYS_exit] "exit",
++    [SYS_wait] "wait",
++    [SYS_pipe] "pipe",
++    [SYS_read] "read",
++    [SYS_kill] "kill",
++    [SYS_exec] "exec",
++    [SYS_fstat] "fstat",
++    [SYS_chdir] "chdir",
++    [SYS_dup] "dup",
++    [SYS_getpid] "getpid",
++    [SYS_sbrk] "sbrk",
++    [SYS_sleep] "sleep",
++    [SYS_uptime] "uptime",
++    [SYS_open] "open",
++    [SYS_write] "write",
++    [SYS_mknod] "mknod",
++    [SYS_unlink] "unlink",
++    [SYS_link] "link",
++    [SYS_mkdir] "mkdir",
++    [SYS_close] "close",
++    [SYS_trace] "trace",
++};
++
++void syscall(void)
+ {
+   int num;
+   struct proc *p = myproc();
+ 
+   num = p->trapframe->a7;
+-  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+-    // Use num to lookup the system call function for num, call it,
+-    // and store its return value in p->trapframe->a0
++  if (num > 0 && num < NELEM(syscalls) && syscalls[num])
++  {
++    if (p->tracenum == num)
++    {
++      printf("pid: %d, syscall: %s, ", p->pid, syscallnames[num]);
++
++      // Switch statement for system calls
++      switch (num)
++      {
++        case SYS_read:
++        case SYS_write:
++        {
++          int fd, n;
++          uint64 addr;
++          argint(0, &fd);
++          argaddr(1, &addr);
++          argint(2, &n);
++          printf("args: (%d, %p, %d), ", fd, (void *)addr, n);
++          break;
++        }
++
++        case SYS_close:
++        {
++          int fd;
++          argint(0, &fd);
++          printf("args: (%d), ", fd);
++          break;
++        }
++
++        case SYS_open:
++        case SYS_unlink:
++        {
++          int n;
++          char path[MAXPATH];
++          argstr(0, path, MAXPATH);
++          argint(1, &n);
++          printf("args: (%s, %d), ", path, n);
++          break;
++        }
++
++        case SYS_exec:
++        {
++          char path[MAXPATH];
++          uint64 argv;
++          argstr(0, path, MAXPATH);
++          argaddr(1, &argv);
++          printf("args: (%s, %p), ", path, (void *)argv);
++          break;
++        }
++
++        case SYS_fork:
++        case SYS_getpid:
++        case SYS_uptime:
++        {
++          printf("args: (), ");
++          break;
++        }
++
++        case SYS_sbrk:
++        {
++          int n;
++          argint(0, &n);
++          printf("args: (%d), ", n);
++          break;
++        }
++
++        case SYS_sleep:
++        {
++          int ticks;
++          argint(0, &ticks);
++          printf("args: (%d), ", ticks);
++          break;
++        }
++
++        case SYS_kill:
++        {
++          int pid;
++          argint(0, &pid);
++          printf("args: (%d), ", pid);
++          break;
++        }
++
++        case SYS_trace:
++        {
++          int pid, syscall_num;
++          argint(0, &pid);
++          argint(1, &syscall_num);
++          printf("args: (%d, %d), ", pid, syscall_num);
++          break;
++        }
++
++        default:
++          break;
++      }
++    }
++
+     p->trapframe->a0 = syscalls[num]();
+-  } else {
+-    printf("%d %s: unknown sys call %d\n",
+-            p->pid, p->name, num);
++
++    if (p->tracenum == num)
++    {
++      printf("return: %ld\n", p->trapframe->a0);
++    }
++  }
++  else
++  {
++    printf("%d %s: unknown sys call %d\n", p->pid, p->name, num);
+     p->trapframe->a0 = -1;
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..ad7c24a 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,7 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_trace  22 //added: trace system call
++#define SYS_info   23 //added: memsize system call
++#define SYS_savestring 24
++#define SYS_loadstring 25
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3b4d5bd..37a236c 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -5,6 +5,10 @@
+ #include "memlayout.h"
+ #include "spinlock.h"
+ #include "proc.h"
++#include "procinfo.h"
++extern struct proc proc[NPROC];
++#define MAX_SIZE 100
++static char kernel_string[MAX_SIZE];
+ 
+ uint64
+ sys_exit(void)
+@@ -91,3 +95,91 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_trace(void)
++{
++  int syscall_num;
++
++  // Fetch the argument which is the system call number to trace
++  argint(0, &syscall_num);
++
++  struct proc *p = myproc();
++  p->tracenum = syscall_num;
++
++  return 0;
++}
++
++uint64
++sys_info(void){
++
++  struct procInfo pInfo;
++  struct procInfo *uInfo;
++
++
++  argaddr(0, (uint64*)&uInfo);
++    
++  struct proc *p;
++  int totalMemUsed = 0;
++  int activeProcessCount = 0;
++
++    // Iterate over all processes in the global proc[] array
++    for (p = proc; p < &proc[NPROC]; p++) {
++        // Lock the process before accessing its fields
++        acquire(&p->lock);
++        
++        // Check if the process is in the RUNNING or RUNNABLE state
++        if (p->state == RUNNING  || p->state == RUNNABLE || p->state == SLEEPING ) {
++            activeProcessCount++;
++            totalMemUsed += p->sz; // Add the memory used by the active process
++        }
++        // Release the lock after accessing the process
++        release(&p->lock);
++    }
++    
++    // Populate the procInfo structure with collected data
++    pInfo.activeProcess = activeProcessCount;  // Number of active processes
++    pInfo.totalProcess = NPROC;                // Total possible number of processes
++    pInfo.memsize = totalMemUsed;              // Total memory used by active processes
++    pInfo.totalMemSize = PHYSTOP - KERNBASE;   // Total available physical memory
++
++    if (copyout(myproc()->pagetable, (uint64)uInfo, (char *)&pInfo, sizeof(pInfo)) < 0) {
++        return -1;
++    }
++
++    return 0;   
++
++}
++uint64
++sys_savestring(void)
++{
++  char command[MAX_SIZE]; // Adjust size as needed
++
++  // Retrieve the string from user space
++  if (argstr(0, command, sizeof(command)) < 0) {
++    return -1; // Error handling if argstr fails
++  }
++  
++  // Copy the string to last_command
++  memmove(kernel_string, command, MAX_SIZE);
++  return 0;
++
++
++}
++
++uint64
++sys_loadstring(void)
++{
++    int buffer_size;
++    char *userBuffer;  // Pointer to the user buffer in user space
++    argaddr(0, (uint64 *)&userBuffer) ;
++    argint(1, &buffer_size);
++    
++    // Copy the last command to the user buffer in user space
++    if (copyout(myproc()->pagetable, (uint64)userBuffer, kernel_string, MAX_SIZE) < 0) {
++        return -1; // Error handling if copyout fails
++    }
++
++
++  return 0;
++}
+\ No newline at end of file
+diff --git a/user/load.c b/user/load.c
+new file mode 100644
+index 0000000..233f629
+--- /dev/null
++++ b/user/load.c
+@@ -0,0 +1,66 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++// Function to handle the core logic of the program
++void myload(int childCount, int allocationAmount) {
++    printf("Parent going to sleep.\n");
++    sleep(10);
++
++    for (int i = 0; i < childCount; i++) {
++        int pid = fork();
++        if (pid == 0) {
++            // Child process logic
++            printf("Child is created.\n");
++            char *mem = malloc(allocationAmount);
++            if (mem == 0) {
++                printf("Memory allocation failed!\n");
++                exit(1);
++            }
++            printf("Child allocated %d bytes.\n", allocationAmount);
++            printf("Child going to sleep.\n");
++            sleep(100);
++            
++            free(mem);  // Free allocated memory before exiting
++            exit(0);
++        } else if (pid < 0) {
++            // Fork failed
++            printf("Fork failed!\n");
++            exit(1);
++        }
++
++        // Parent sleeps a bit between child creation
++        sleep(10);
++    }
++
++    // Call the info system call
++    struct procInfo total;
++    if (info(&total) < 0) {
++        printf("Error: Failed to retrieve system info.\n");
++        exit(1);
++    }
++
++    // Display the system information
++    printf("Parent wake up.\n");
++    printf("Current system information:\n");
++    printf("Processes: %d/%d\n", total.activeProcess, total.totalProcess);
++    printf("RAM : %d/%d bytes\n", total.memsize, total.totalMemSize);
++
++    // Parent waits for all child processes to complete
++}
++
++int main(int argc, char *argv[]) {
++    if (argc != 3) {
++        printf("Usage: load <childCount> <allocationAmount>\n");
++        exit(1);
++    }
++
++    // Get the number of child processes and the amount of memory to allocate
++    int childCount = atoi(argv[1]);
++    int allocationAmount = atoi(argv[2]);
++
++    // Call myload function to handle the logic
++    myload(childCount, allocationAmount);
++
++    exit(0);
++}
+diff --git a/user/sh.c b/user/sh.c
+index 836ebcb..d8b2619 100644
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -5,25 +5,28 @@
+ #include "kernel/fcntl.h"
+ 
+ // Parsed command representation
+-#define EXEC  1
++#define EXEC 1
+ #define REDIR 2
+-#define PIPE  3
+-#define LIST  4
+-#define BACK  5
++#define PIPE 3
++#define LIST 4
++#define BACK 5
+ 
+ #define MAXARGS 10
+ 
+-struct cmd {
++struct cmd
++{
+   int type;
+ };
+ 
+-struct execcmd {
++struct execcmd
++{
+   int type;
+   char *argv[MAXARGS];
+   char *eargv[MAXARGS];
+ };
+ 
+-struct redircmd {
++struct redircmd
++{
+   int type;
+   struct cmd *cmd;
+   char *file;
+@@ -32,31 +35,33 @@ struct redircmd {
+   int fd;
+ };
+ 
+-struct pipecmd {
++struct pipecmd
++{
+   int type;
+   struct cmd *left;
+   struct cmd *right;
+ };
+ 
+-struct listcmd {
++struct listcmd
++{
+   int type;
+   struct cmd *left;
+   struct cmd *right;
+ };
+ 
+-struct backcmd {
++struct backcmd
++{
+   int type;
+   struct cmd *cmd;
+ };
+ 
+-int fork1(void);  // Fork but panics on failure.
+-void panic(char*);
+-struct cmd *parsecmd(char*);
+-void runcmd(struct cmd*) __attribute__((noreturn));
++int fork1(void); // Fork but panics on failure.
++void panic(char *);
++struct cmd *parsecmd(char *);
++void runcmd(struct cmd *) __attribute__((noreturn));
+ 
+ // Execute cmd.  Never returns.
+-void
+-runcmd(struct cmd *cmd)
++void runcmd(struct cmd *cmd)
+ {
+   int p[2];
+   struct backcmd *bcmd;
+@@ -65,25 +70,27 @@ runcmd(struct cmd *cmd)
+   struct pipecmd *pcmd;
+   struct redircmd *rcmd;
+ 
+-  if(cmd == 0)
++  if (cmd == 0)
+     exit(1);
+ 
+-  switch(cmd->type){
++  switch (cmd->type)
++  {
+   default:
+     panic("runcmd");
+ 
+   case EXEC:
+-    ecmd = (struct execcmd*)cmd;
+-    if(ecmd->argv[0] == 0)
++    ecmd = (struct execcmd *)cmd;
++    if (ecmd->argv[0] == 0)
+       exit(1);
+     exec(ecmd->argv[0], ecmd->argv);
+     fprintf(2, "exec %s failed\n", ecmd->argv[0]);
+     break;
+ 
+   case REDIR:
+-    rcmd = (struct redircmd*)cmd;
++    rcmd = (struct redircmd *)cmd;
+     close(rcmd->fd);
+-    if(open(rcmd->file, rcmd->mode) < 0){
++    if (open(rcmd->file, rcmd->mode) < 0)
++    {
+       fprintf(2, "open %s failed\n", rcmd->file);
+       exit(1);
+     }
+@@ -91,25 +98,27 @@ runcmd(struct cmd *cmd)
+     break;
+ 
+   case LIST:
+-    lcmd = (struct listcmd*)cmd;
+-    if(fork1() == 0)
++    lcmd = (struct listcmd *)cmd;
++    if (fork1() == 0)
+       runcmd(lcmd->left);
+     wait(0);
+     runcmd(lcmd->right);
+     break;
+ 
+   case PIPE:
+-    pcmd = (struct pipecmd*)cmd;
+-    if(pipe(p) < 0)
++    pcmd = (struct pipecmd *)cmd;
++    if (pipe(p) < 0)
+       panic("pipe");
+-    if(fork1() == 0){
++    if (fork1() == 0)
++    {
+       close(1);
+       dup(p[1]);
+       close(p[0]);
+       close(p[1]);
+       runcmd(pcmd->left);
+     }
+-    if(fork1() == 0){
++    if (fork1() == 0)
++    {
+       close(0);
+       dup(p[0]);
+       close(p[0]);
+@@ -123,77 +132,158 @@ runcmd(struct cmd *cmd)
+     break;
+ 
+   case BACK:
+-    bcmd = (struct backcmd*)cmd;
+-    if(fork1() == 0)
++    bcmd = (struct backcmd *)cmd;
++    if (fork1() == 0)
+       runcmd(bcmd->cmd);
+     break;
+   }
+   exit(0);
+ }
+ 
+-int
+-getcmd(char *buf, int nbuf)
++int getcmd(char *buf, int nbuf)
+ {
+   write(2, "$ ", 2);
+   memset(buf, 0, nbuf);
+   gets(buf, nbuf);
+-  if(buf[0] == 0) // EOF
++  if (buf[0] == 0) // EOF
+     return -1;
+   return 0;
+ }
+-
+-int
+-main(void)
++#define MAX_SIZE 100
++int main(void)
+ {
+   static char buf[100];
+   int fd;
+ 
+   // Ensure that three file descriptors are open.
+-  while((fd = open("console", O_RDWR)) >= 0){
+-    if(fd >= 3){
++  while ((fd = open("console", O_RDWR)) >= 0)
++  {
++    if (fd >= 3)
++    {
+       close(fd);
+       break;
+     }
+   }
+ 
+   // Read and run input commands.
+-  while(getcmd(buf, sizeof(buf)) >= 0){
+-    if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
++  while (getcmd(buf, sizeof(buf)) >= 0)
++  {
++    // Define the target and replacement strings
++    char target[] = "!!";
++    char replacement[MAX_SIZE];
++    loadstring(replacement, sizeof(replacement)); // Load last command into replacement buffer
++
++    int flag = 0;             // To track if a replacement is made
++    int len = strlen(target); // Length of the target sequence
++
++    // Initialize position variables
++    int position = -1;
++    int i = 0, j = 0;
++
++    // Find the target sequence "!!" manually
++    while (buf[i] != '\0')
++    {
++      int match = 1;
++      for (j = 0; j < len; j++)
++      {
++        if (buf[i + j] != target[j])
++        {
++          match = 0;
++          break;
++        }
++      }
++
++      if (match)
++      {
++        position = i; // Store the position of the match
++        break;
++      }
++      i++;
++    }
++
++    if (position != -1)
++    {
++      // Prepare a buffer to store the modified string
++      char temp_buffer[100];
++      int k = 0;
++
++      // Copy everything before the "!!" to temp_buffer
++      for (i = 0; i < position; i++)
++      {
++        temp_buffer[k++] = buf[i];
++      }
++
++      // Copy the replacement string to temp_buffer
++      for (i = 0; replacement[i] != '\0'; i++)
++      {
++        temp_buffer[k++] = replacement[i];
++      }
++
++      // Copy the rest of the buffer after "!!"
++      for (i = position + len; buf[i] != '\0'; i++)
++      {
++        temp_buffer[k++] = buf[i];
++      }
++
++      // Null-terminate the temp_buffer
++      temp_buffer[k] = '\0';
++
++      // Copy the modified string back to buf
++      for (i = 0; temp_buffer[i] != '\0'; i++)
++      {
++        buf[i] = temp_buffer[i];
++      }
++      buf[i] = '\0'; // Null-terminate buf
++
++      flag = 1; // Replacement was successful
++    }
++
++    if (!flag)
++    {
++      // If no replacement was made, save the current buffer content
++      savestring(buf);
++    }
++    else
++    {
++      // If replacement was made, print the modified buffer content
++      printf("%s", buf);
++    }
++
++    if (buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' ')
++    {
+       // Chdir must be called by the parent, not the child.
+-      buf[strlen(buf)-1] = 0;  // chop \n
+-      if(chdir(buf+3) < 0)
+-        fprintf(2, "cannot cd %s\n", buf+3);
++      buf[strlen(buf) - 1] = 0; // chop \n
++      if (chdir(buf + 3) < 0)
++        fprintf(2, "cannot cd %s\n", buf + 3);
+       continue;
+     }
+-    if(fork1() == 0)
++    if (fork1() == 0)
+       runcmd(parsecmd(buf));
+     wait(0);
+   }
+   exit(0);
+ }
+ 
+-void
+-panic(char *s)
++void panic(char *s)
+ {
+   fprintf(2, "%s\n", s);
+   exit(1);
+ }
+ 
+-int
+-fork1(void)
++int fork1(void)
+ {
+   int pid;
+ 
+   pid = fork();
+-  if(pid == -1)
++  if (pid == -1)
+     panic("fork");
+   return pid;
+ }
+ 
+-//PAGEBREAK!
+-// Constructors
++// PAGEBREAK!
++//  Constructors
+ 
+-struct cmd*
++struct cmd *
+ execcmd(void)
+ {
+   struct execcmd *cmd;
+@@ -201,10 +291,10 @@ execcmd(void)
+   cmd = malloc(sizeof(*cmd));
+   memset(cmd, 0, sizeof(*cmd));
+   cmd->type = EXEC;
+-  return (struct cmd*)cmd;
++  return (struct cmd *)cmd;
+ }
+ 
+-struct cmd*
++struct cmd *
+ redircmd(struct cmd *subcmd, char *file, char *efile, int mode, int fd)
+ {
+   struct redircmd *cmd;
+@@ -217,10 +307,10 @@ redircmd(struct cmd *subcmd, char *file, char *efile, int mode, int fd)
+   cmd->efile = efile;
+   cmd->mode = mode;
+   cmd->fd = fd;
+-  return (struct cmd*)cmd;
++  return (struct cmd *)cmd;
+ }
+ 
+-struct cmd*
++struct cmd *
+ pipecmd(struct cmd *left, struct cmd *right)
+ {
+   struct pipecmd *cmd;
+@@ -230,10 +320,10 @@ pipecmd(struct cmd *left, struct cmd *right)
+   cmd->type = PIPE;
+   cmd->left = left;
+   cmd->right = right;
+-  return (struct cmd*)cmd;
++  return (struct cmd *)cmd;
+ }
+ 
+-struct cmd*
++struct cmd *
+ listcmd(struct cmd *left, struct cmd *right)
+ {
+   struct listcmd *cmd;
+@@ -243,10 +333,10 @@ listcmd(struct cmd *left, struct cmd *right)
+   cmd->type = LIST;
+   cmd->left = left;
+   cmd->right = right;
+-  return (struct cmd*)cmd;
++  return (struct cmd *)cmd;
+ }
+ 
+-struct cmd*
++struct cmd *
+ backcmd(struct cmd *subcmd)
+ {
+   struct backcmd *cmd;
+@@ -255,27 +345,27 @@ backcmd(struct cmd *subcmd)
+   memset(cmd, 0, sizeof(*cmd));
+   cmd->type = BACK;
+   cmd->cmd = subcmd;
+-  return (struct cmd*)cmd;
++  return (struct cmd *)cmd;
+ }
+-//PAGEBREAK!
+-// Parsing
++// PAGEBREAK!
++//  Parsing
+ 
+ char whitespace[] = " \t\r\n\v";
+ char symbols[] = "<|>&;()";
+ 
+-int
+-gettoken(char **ps, char *es, char **q, char **eq)
++int gettoken(char **ps, char *es, char **q, char **eq)
+ {
+   char *s;
+   int ret;
+ 
+   s = *ps;
+-  while(s < es && strchr(whitespace, *s))
++  while (s < es && strchr(whitespace, *s))
+     s++;
+-  if(q)
++  if (q)
+     *q = s;
+   ret = *s;
+-  switch(*s){
++  switch (*s)
++  {
+   case 0:
+     break;
+   case '|':
+@@ -288,44 +378,44 @@ gettoken(char **ps, char *es, char **q, char **eq)
+     break;
+   case '>':
+     s++;
+-    if(*s == '>'){
++    if (*s == '>')
++    {
+       ret = '+';
+       s++;
+     }
+     break;
+   default:
+     ret = 'a';
+-    while(s < es && !strchr(whitespace, *s) && !strchr(symbols, *s))
++    while (s < es && !strchr(whitespace, *s) && !strchr(symbols, *s))
+       s++;
+     break;
+   }
+-  if(eq)
++  if (eq)
+     *eq = s;
+ 
+-  while(s < es && strchr(whitespace, *s))
++  while (s < es && strchr(whitespace, *s))
+     s++;
+   *ps = s;
+   return ret;
+ }
+ 
+-int
+-peek(char **ps, char *es, char *toks)
++int peek(char **ps, char *es, char *toks)
+ {
+   char *s;
+ 
+   s = *ps;
+-  while(s < es && strchr(whitespace, *s))
++  while (s < es && strchr(whitespace, *s))
+     s++;
+   *ps = s;
+   return *s && strchr(toks, *s);
+ }
+ 
+-struct cmd *parseline(char**, char*);
+-struct cmd *parsepipe(char**, char*);
+-struct cmd *parseexec(char**, char*);
+-struct cmd *nulterminate(struct cmd*);
++struct cmd *parseline(char **, char *);
++struct cmd *parsepipe(char **, char *);
++struct cmd *parseexec(char **, char *);
++struct cmd *nulterminate(struct cmd *);
+ 
+-struct cmd*
++struct cmd *
+ parsecmd(char *s)
+ {
+   char *es;
+@@ -334,7 +424,8 @@ parsecmd(char *s)
+   es = s + strlen(s);
+   cmd = parseline(&s, es);
+   peek(&s, es, "");
+-  if(s != es){
++  if (s != es)
++  {
+     fprintf(2, "leftovers: %s\n", s);
+     panic("syntax");
+   }
+@@ -342,78 +433,83 @@ parsecmd(char *s)
+   return cmd;
+ }
+ 
+-struct cmd*
++struct cmd *
+ parseline(char **ps, char *es)
+ {
+   struct cmd *cmd;
+ 
+   cmd = parsepipe(ps, es);
+-  while(peek(ps, es, "&")){
++  while (peek(ps, es, "&"))
++  {
+     gettoken(ps, es, 0, 0);
+     cmd = backcmd(cmd);
+   }
+-  if(peek(ps, es, ";")){
++  if (peek(ps, es, ";"))
++  {
+     gettoken(ps, es, 0, 0);
+     cmd = listcmd(cmd, parseline(ps, es));
+   }
+   return cmd;
+ }
+ 
+-struct cmd*
++struct cmd *
+ parsepipe(char **ps, char *es)
+ {
+   struct cmd *cmd;
+ 
+   cmd = parseexec(ps, es);
+-  if(peek(ps, es, "|")){
++  if (peek(ps, es, "|"))
++  {
+     gettoken(ps, es, 0, 0);
+     cmd = pipecmd(cmd, parsepipe(ps, es));
+   }
+   return cmd;
+ }
+ 
+-struct cmd*
++struct cmd *
+ parseredirs(struct cmd *cmd, char **ps, char *es)
+ {
+   int tok;
+   char *q, *eq;
+ 
+-  while(peek(ps, es, "<>")){
++  while (peek(ps, es, "<>"))
++  {
+     tok = gettoken(ps, es, 0, 0);
+-    if(gettoken(ps, es, &q, &eq) != 'a')
++    if (gettoken(ps, es, &q, &eq) != 'a')
+       panic("missing file for redirection");
+-    switch(tok){
++    switch (tok)
++    {
+     case '<':
+       cmd = redircmd(cmd, q, eq, O_RDONLY, 0);
+       break;
+     case '>':
+-      cmd = redircmd(cmd, q, eq, O_WRONLY|O_CREATE|O_TRUNC, 1);
++      cmd = redircmd(cmd, q, eq, O_WRONLY | O_CREATE | O_TRUNC, 1);
+       break;
+-    case '+':  // >>
+-      cmd = redircmd(cmd, q, eq, O_WRONLY|O_CREATE, 1);
++    case '+': // >>
++      cmd = redircmd(cmd, q, eq, O_WRONLY | O_CREATE, 1);
+       break;
+     }
+   }
+   return cmd;
+ }
+ 
+-struct cmd*
++struct cmd *
+ parseblock(char **ps, char *es)
+ {
+   struct cmd *cmd;
+ 
+-  if(!peek(ps, es, "("))
++  if (!peek(ps, es, "("))
+     panic("parseblock");
+   gettoken(ps, es, 0, 0);
+   cmd = parseline(ps, es);
+-  if(!peek(ps, es, ")"))
++  if (!peek(ps, es, ")"))
+     panic("syntax - missing )");
+   gettoken(ps, es, 0, 0);
+   cmd = parseredirs(cmd, ps, es);
+   return cmd;
+ }
+ 
+-struct cmd*
++struct cmd *
+ parseexec(char **ps, char *es)
+ {
+   char *q, *eq;
+@@ -421,23 +517,24 @@ parseexec(char **ps, char *es)
+   struct execcmd *cmd;
+   struct cmd *ret;
+ 
+-  if(peek(ps, es, "("))
++  if (peek(ps, es, "("))
+     return parseblock(ps, es);
+ 
+   ret = execcmd();
+-  cmd = (struct execcmd*)ret;
++  cmd = (struct execcmd *)ret;
+ 
+   argc = 0;
+   ret = parseredirs(ret, ps, es);
+-  while(!peek(ps, es, "|)&;")){
+-    if((tok=gettoken(ps, es, &q, &eq)) == 0)
++  while (!peek(ps, es, "|)&;"))
++  {
++    if ((tok = gettoken(ps, es, &q, &eq)) == 0)
+       break;
+-    if(tok != 'a')
++    if (tok != 'a')
+       panic("syntax");
+     cmd->argv[argc] = q;
+     cmd->eargv[argc] = eq;
+     argc++;
+-    if(argc >= MAXARGS)
++    if (argc >= MAXARGS)
+       panic("too many args");
+     ret = parseredirs(ret, ps, es);
+   }
+@@ -447,7 +544,7 @@ parseexec(char **ps, char *es)
+ }
+ 
+ // NUL-terminate all the counted strings.
+-struct cmd*
++struct cmd *
+ nulterminate(struct cmd *cmd)
+ {
+   int i;
+@@ -457,36 +554,37 @@ nulterminate(struct cmd *cmd)
+   struct pipecmd *pcmd;
+   struct redircmd *rcmd;
+ 
+-  if(cmd == 0)
++  if (cmd == 0)
+     return 0;
+ 
+-  switch(cmd->type){
++  switch (cmd->type)
++  {
+   case EXEC:
+-    ecmd = (struct execcmd*)cmd;
+-    for(i=0; ecmd->argv[i]; i++)
++    ecmd = (struct execcmd *)cmd;
++    for (i = 0; ecmd->argv[i]; i++)
+       *ecmd->eargv[i] = 0;
+     break;
+ 
+   case REDIR:
+-    rcmd = (struct redircmd*)cmd;
++    rcmd = (struct redircmd *)cmd;
+     nulterminate(rcmd->cmd);
+     *rcmd->efile = 0;
+     break;
+ 
+   case PIPE:
+-    pcmd = (struct pipecmd*)cmd;
++    pcmd = (struct pipecmd *)cmd;
+     nulterminate(pcmd->left);
+     nulterminate(pcmd->right);
+     break;
+ 
+   case LIST:
+-    lcmd = (struct listcmd*)cmd;
++    lcmd = (struct listcmd *)cmd;
+     nulterminate(lcmd->left);
+     nulterminate(lcmd->right);
+     break;
+ 
+   case BACK:
+-    bcmd = (struct backcmd*)cmd;
++    bcmd = (struct backcmd *)cmd;
+     nulterminate(bcmd->cmd);
+     break;
+   }
+diff --git a/user/trace.c b/user/trace.c
+new file mode 100644
+index 0000000..401b189
+--- /dev/null
++++ b/user/trace.c
+@@ -0,0 +1,31 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  int i;
++  char *nargv[MAXARG];
++
++  if(argc < 3 || (argv[1][0] < '0' || argv[1][0] > '9')){
++    fprintf(2, "Usage: %s sys_call_num command\n", argv[0]);
++    exit(1);
++  }
++
++  if (trace(atoi(argv[1])) < 0) {
++    fprintf(2, "%s: trace failed\n", argv[0]);
++    exit(1);
++  }
++
++  for(i = 2; i < argc && i < MAXARG; i++){
++    nargv[i-2] = argv[i];
++  }
++  exec(nargv[0], nargv);
++
++  printf("hellooooooooo\n");
++
++  exit(0);
++
++}
+diff --git a/user/user.h b/user/user.h
+index 04013ca..015aaeb 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,4 +1,5 @@
+ struct stat;
++#include "kernel/procinfo.h"
+ 
+ // system calls
+ int fork(void);
+@@ -22,6 +23,10 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int trace(int); //added: trace system call
++int info(struct procInfo*); //added: info system call
++int savestring(char *str);
++int loadstring(char *buffer, int size);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..622dcd7 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,7 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("trace");
++entry("info");
++entry("savestring");
++entry("loadstring");
+\ No newline at end of file
